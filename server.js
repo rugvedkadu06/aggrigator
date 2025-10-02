@@ -92,7 +92,7 @@ const AggregatedIssueSchema = new mongoose.Schema({
     location: String,
     coordinates: { latitude: Number, longitude: Number },
     status: String,
-    imageUrl: String,
+    imageUrl: String, // This will hold the annotated image URL if available (main image)
     submittedBy: String,
     redFlags: Number,
     greenFlags: Number,
@@ -136,7 +136,7 @@ async function fetchAggregateAndSaveData() {
             },
             { $unwind: { path: '$submittedUserArr', preserveNullAndEmptyArrays: true } },
 
-            // 2. Lookup all Flags for this Issue (using 'flogs' as seen in your DB image)
+            // 2. Lookup all Flags for this Issue (using 'flogs' collection name)
             {
                 $lookup: { from: 'flogs', localField: '_id', foreignField: 'issueId', as: 'issueFlags' } 
             },
@@ -152,10 +152,20 @@ async function fetchAggregateAndSaveData() {
                     // ISSUE FIELDS
                     sourceIssueId: '$_id',
                     title: 1, description: 1, location: 1, coordinates: 1,
-                    status: 1, imageUrl: 1, submittedBy: 1, redFlags: 1, greenFlags: 1,
+                    status: 1, 
+                    
+                    // **CORRECTED IMAGE URL LOGIC**: Use annotated URL if present, otherwise use original Issue URL
+                    imageUrl: {
+                        $ifNull: [
+                            { $arrayElemAt: ['$detectionData.annotatedImageUrl', 0] }, 
+                            '$imageUrl' 
+                        ]
+                    },
+                    
+                    submittedBy: 1, redFlags: 1, greenFlags: 1,
                     createdAt: 1, updatedAt: 1,
 
-                    // EMBEDDED DETECTION FIELDS (from the first detection document in the array)
+                    // EMBEDDED DETECTION FIELDS (The raw detection fields for detailed view)
                     annotatedImageUrl: { $arrayElemAt: ['$detectionData.annotatedImageUrl', 0] },
                     detections: { $arrayElemAt: ['$detectionData.detections', 0] },
                     detectedAt: { $arrayElemAt: ['$detectionData.createdAt', 0] },
@@ -170,7 +180,7 @@ async function fetchAggregateAndSaveData() {
                         faceImageUrl: '$submittedUserArr.faceImageUrl',
                     },
 
-                    // EMBEDDED FLAGS ARRAY (renamed for cleanliness)
+                    // EMBEDDED FLAGS ARRAY
                     issueFlags: 1,
                 }
             },
