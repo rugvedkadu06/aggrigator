@@ -1,334 +1,400 @@
-// data_aggregator.js
+// server.js
 
 import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
+import bodyParser from "body-parser";
+import jwt from "jsonwebtoken";
+import { v2 as cloudinary } from "cloudinary";
+import multer from "multer";
 import { config } from "dotenv";
 
-config(); // Load environment variables from .env
+config();
 
 const app = express();
-const PORT = process.env.PORT || 5002;
+const PORT = process.env.PORT || 5001;
 
-// --- DATABASE CONNECTION CONFIGURATION ---
-
-// 1. Connection for READING (Source DB: 'test', as used in your model files)
-const sourceDB = mongoose.createConnection(process.env.MONGO_URI, { dbName: 'test' });
-sourceDB.on('error', (err) => console.error("Source DB Connection Error:", err));
-sourceDB.once('open', () => console.log("✅ Source MongoDB Connected (DB: test)"));
-
-// 2. Connection for WRITING (Target DB: 'janvaani_aggregated_data', as requested)
-const TARGET_DB_NAME = 'janvaani_aggregated_data'; 
-const targetDB = mongoose.createConnection(process.env.MONGO_URI, { dbName: TARGET_DB_NAME });
-targetDB.on('error', (err) => console.error("Target DB Connection Error:", err));
-targetDB.once('open', () => console.log(`✅ Target MongoDB Connected (DB: ${TARGET_DB_NAME})`));
+// === PLACEHOLDER CONSTANT ===
+const PLACEHOLDER_FACE_IMAGE = "https://picsum.photos/seed/face/200/200";
+const PLACEHOLDER_ANNOTATED_IMAGE = "https://picsum.photos/seed/annotated/800/600";
+const PLACEHOLDER_ISSUE_IMAGE = "https://picsum.photos/seed/issue/800/600";
 
 
-// --- SCHEMAS & MODELS (Bound to Source DB - based on server.js) ---
+// --- MIDDLEWARE ---
+app.use(cors());
+app.use(bodyParser.json());
 
-// 1. Detection Schema (renamed to link via issueId)
-const DetectionSchema = new mongoose.Schema({
-    issueId: { type: mongoose.Schema.Types.ObjectId, ref: 'Issue', required: true },
-    annotatedImageUrl: String,
-    detections: Array,
-    createdAt: Date,
-}, { collection: 'detections' }); // Must specify collection name for the Model bound to sourceDB
+// --- DATABASE (MONGODB) ---
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch((err) => console.error("MongoDB Connection Error:", err));
 
-// 2. Issue Schema (from server.js)
-const IssueSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    title: String,
-    description: String,
-    location: String,
-    coordinates: {
-        latitude: Number,
-        longitude: Number
-    },
-    status: { type: String, default: 'pending' },
-    imageUrl: String,
-    submittedBy: String,
-    redFlags: { type: Number, default: 0 },
-    greenFlags: { type: Number, default: 0 },
-}, { timestamps: true });
-
-// 3. Flag Schema (from server.js)
-const FlagSchema = new mongoose.Schema({
-    issueId: { type: mongoose.Schema.Types.ObjectId, ref: 'Issue', required: true },
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    userName: { type: String, required: true },
-    userEmail: { type: String, required: true },
-    type: { type: String, enum: ['red', 'green'], required: true },
-    reason: { type: String },
-}, { timestamps: true });
-
-// 4. User Schema (from server.js)
+// --- SCHEMAS ---
 const UserSchema = new mongoose.Schema({
-    name: { type: String, required: true },
-    email: { type: String, required: true, unique: true },
-    phone: { type: String, required: true },
-    otp: String,
-    otpExpiry: Date,
-    verified: { type: Boolean, default: false },
-    faceImageUrl: { type: String, default: "" },
-    points: { type: Number, default: 10000 },
+  name: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  phone: { type: String, required: true },
+  otp: String,
+  otpExpiry: Date,
+  verified: { type: Boolean, default: false },
+  faceImageUrl: { type: String, default: "" },
+  points: { type: Number, default: 10000 },
 });
 
-// Models bound to the sourceDB connection
-const User = sourceDB.model("User", UserSchema);
-const Issue = sourceDB.model("Issue", IssueSchema);
-const Flag = sourceDB.model("Flag", FlagSchema); // Mongoose defaults to 'flags' or use 'flogs' if necessary in $lookup
-const Detection = sourceDB.model("Detection", DetectionSchema); // Mongoose defaults to 'detections'
+const IssueSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: String,
+  description: String,
+  location: String,
+  coordinates: {
+    latitude: Number,
+    longitude: Number
+  },
+  status: { type: String, default: 'pending' },
+  imageUrl: { type: String, default: PLACEHOLDER_ISSUE_IMAGE },
+  submittedBy: String,
+  redFlags: { type: Number, default: 0 },
+  greenFlags: { type: Number, default: 0 },
+}, { timestamps: true });
 
+const FlagSchema = new mongoose.Schema({
+  issueId: { type: mongoose.Schema.Types.ObjectId, ref: 'Issue', required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  userName: { type: String, required: true },
+  userEmail: { type: String, required: true },
+  type: { type: String, enum: ['red', 'green'], required: true },
+  reason: { type: String },
+}, { timestamps: true });
 
-// --- NEW MODEL FOR SAVING AGGREGATED DATA ---
-
-// This schema defines the structure of the final denormalized object with all fields.
-const AggregatedIssueSchema = new mongoose.Schema({
-    // --- Issue Fields ---
-    _id: mongoose.Schema.Types.ObjectId, 
-    sourceIssueId: mongoose.Schema.Types.ObjectId, // For clarity
-    title: String,
-    description: String,
-    location: String,
-    coordinates: { latitude: Number, longitude: Number },
-    status: String,
-    imageUrl: String,
-    submittedBy: String,
-    redFlags: Number,
-    greenFlags: Number,
-    createdAt: Date,
-    updatedAt: Date,
-
-    // --- Embedded Detection Data (First Match) ---
+const DetectionSchema = new mongoose.Schema({
+    // Assumed link back to the issue for the aggregation to work
+    issueId: { type: mongoose.Schema.Types.ObjectId, ref: 'Issue', required: true },
     annotatedImageUrl: String,
-    detections: Array,
-    detectedAt: Date,
-    
-    // --- Embedded Submitting User Details ---
-    submittedUser: {
-        sourceUserId: mongoose.Schema.Types.ObjectId,
-        name: String,
-        email: String,
-        phone: String,
-        points: Number,
-        faceImageUrl: String,
-    },
-    
-    // --- Embedded Flag Data (Full Array) ---
-    issueFlags: [{
-        sourceFlagId: mongoose.Schema.Types.ObjectId,
-        userId: mongoose.Schema.Types.ObjectId,
-        userName: String,
-        userEmail: String,
-        type: String,
-        reason: String,
-        createdAt: Date,
-    }],
-    
-}, { collection: 'agrigate' }); // Target collection name
-
-// Model bound to the targetDB connection
-const AggregatedIssue = targetDB.model("AggregatedIssue", AggregatedIssueSchema);
+    detections: Array, // Array of detected objects
+    createdAt: Date,
+});
 
 
-// --- REUSABLE AGGREGATION AND SAVE FUNCTION ---
-async function fetchAggregateAndSaveData() {
-    console.log(`\n--- STARTING AGGREGATION AND SAVE at ${new Date().toLocaleTimeString()} ---`);
+const User = mongoose.model("User", UserSchema);
+const Issue = mongoose.model("Issue", IssueSchema);
+const Flag = mongoose.model("Flag", FlagSchema);
+const Detection = mongoose.model("Detection", DetectionSchema, 'detections'); // Specify collection name 'detections'
+
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
+
+// --- AUTH ROUTES ---
+app.post("/api/auth/register-send-otp", async (req, res) => {
+  try {
+    const { name, email, phone } = req.body;
+    if (!email || !name || !phone) return res.status(400).json({ error: "All fields are required" });
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser && existingUser.verified) {
+      return res.status(400).json({ error: "User with this email already exists." });
+    }
+
+    const otp = "124590";
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
+
+    await User.findOneAndUpdate(
+      { email },
+      { name, phone, otp, otpExpiry, verified: false },
+      { upsert: true, new: true }
+    );
+
+    res.json({ success: true, message: "OTP process initialized. Use static OTP 124590 to verify." });
+  } catch (err) {
+    console.error("❌ OTP send error:", err);
+    res.status(500).json({ error: "Server error while setting up OTP." });
+  }
+});
+
+app.post("/api/auth/verify-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const user = await User.findOne({ email });
+
+    if (!user) return res.status(404).json({ error: "User not found." });
+    if (user.otp !== otp || new Date() > user.otpExpiry) {
+      return res.status(400).json({ error: "Invalid or expired OTP." });
+    }
+
+    if (!user.faceImageUrl) {
+        user.faceImageUrl = PLACEHOLDER_FACE_IMAGE;
+    }
+
+    user.verified = true;
+    user.otp = undefined;
+    user.otpExpiry = undefined;
+    await user.save();
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+    res.json({
+      success: true,
+      token,
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, points: user.points, faceImageUrl: user.faceImageUrl }
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error during verification." });
+  }
+});
+
+// --- JWT AUTH MIDDLEWARE ---
+const authMiddleware = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Access denied. No token provided.' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.id;
+    next();
+  } catch (ex) {
+    res.status(400).json({ error: 'Invalid token.' });
+  }
+};
+
+// --- PROTECTED USER ROUTES ---
+app.post('/api/user/upload-face', authMiddleware, upload.single('faceImage'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image file provided.' });
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream({ folder: "janvaani_faces" }, (error, result) => {
+        if (error) reject(error); else resolve(result);
+      });
+      uploadStream.end(req.file.buffer);
+    });
     
+    const user = await User.findByIdAndUpdate(req.userId, { faceImageUrl: result.secure_url }, { new: true });
+    res.json({ success: true, message: 'Face image updated!', faceImageUrl: user.faceImageUrl });
+  } catch (err) {
+    res.status(500).json({ error: 'Image upload failed.' });
+  }
+});
+
+app.get('/api/user/me', authMiddleware, async (req, res) => {
+    const user = await User.findById(req.userId).select('-otp -otpExpiry');
+    res.json(user);
+});
+
+// --- PROTECTED ISSUE ROUTES ---
+
+app.get('/api/issues', authMiddleware, async (req, res) => {
+    const { filter } = req.query;
+    let matchQuery = {};
+    
+    if (filter !== 'active') { // If filter is not 'active', show only user's own issues
+        matchQuery = { userId: new mongoose.Types.ObjectId(req.userId) };
+    }
+
     try {
-        // 1. Aggregation Pipeline
-        const issuesToSave = await Issue.aggregate([
-            // 1. Lookup the submitting User details
+        const issues = await Issue.aggregate([
+            // 1. Filter issues based on the user or 'active' status
+            { $match: matchQuery },
+
+            // 2. Perform a left join with the 'detections' collection
             {
-                $lookup: { from: 'users', localField: 'userId', foreignField: '_id', as: 'submittedUserArr' }
-            },
-            { $unwind: { path: '$submittedUserArr', preserveNullAndEmptyArrays: true } },
-
-            // 2. Lookup all Flags for this Issue
-            {
-                // NOTE: Using 'flogs' if that is the actual collection name for Flags
-                $lookup: { from: 'flogs', localField: '_id', foreignField: 'issueId', as: 'issueFlags' } 
-            },
-
-            // 3. Lookup Detection Data (1-to-1 or 1-to-many, we'll take the first)
-            {
-                $lookup: { from: 'detections', localField: '_id', foreignField: 'issueId', as: 'detectionData' }
-            },
-
-            // 4. Project the final, flattened structure
-            {
-                $project: {
-                    // ISSUE FIELDS
-                    sourceIssueId: '$_id',
-                    title: 1, description: 1, location: 1, coordinates: 1,
-                    status: 1, imageUrl: 1, submittedBy: 1, redFlags: 1, greenFlags: 1,
-                    createdAt: 1, updatedAt: 1,
-
-                    // EMBEDDED DETECTION FIELDS (from the first detection document)
-                    annotatedImageUrl: { $arrayElemAt: ['$detectionData.annotatedImageUrl', 0] },
-                    detections: { $arrayElemAt: ['$detectionData.detections', 0] },
-                    detectedAt: { $arrayElemAt: ['$detectionData.createdAt', 0] },
-
-                    // EMBEDDED USER FIELDS (flattened)
-                    submittedUser: {
-                        sourceUserId: '$submittedUserArr._id',
-                        name: '$submittedUserArr.name',
-                        email: '$submittedUserArr.email',
-                        phone: '$submittedUserArr.phone',
-                        points: '$submittedUserArr.points',
-                        faceImageUrl: '$submittedUserArr.faceImageUrl',
-                    },
-
-                    // EMBEDDED FLAGS ARRAY
-                    issueFlags: {
-                        $map: {
-                            input: '$issueFlags',
-                            as: 'flag',
-                            in: {
-                                sourceFlagId: '$$flag._id',
-                                userId: '$$flag.userId',
-                                userName: '$$flag.userName',
-                                userEmail: '$$flag.userEmail',
-                                type: '$$flag.type',
-                                reason: '$$flag.reason',
-                                createdAt: '$$flag.createdAt',
-                            }
-                        }
-                    },
+                $lookup: {
+                    from: 'detections',        // The collection to join with (collection name)
+                    localField: '_id',         // Field from the input documents (Issue's _id)
+                    foreignField: 'issueId',   // Field from the documents of the 'detections' collection
+                    as: 'detectionData'        // Name of the new array field to add to the Issue documents
                 }
             },
-            { $sort: { createdAt: -1 } }
-        ]);
 
-        // 2. Get Metadata
-        const users = await User.find({}).lean();
-        const flags = await Flag.find({}).lean();
-        
-        const aggregatedData = {
-            metadata: {
-                timestamp: new Date().toISOString(),
-                totalIssues: issuesToSave.length,
-                totalUsers: users.length,
-                totalFlags: flags.length,
+            // 3. Project the final structure (pulling out the needed detection fields)
+            {
+                $project: {
+                    // Include all existing Issue fields
+                    _id: 1, userId: 1, title: 1, description: 1, location: 1,
+                    coordinates: 1, status: 1, imageUrl: 1, submittedBy: 1,
+                    redFlags: 1, greenFlags: 1, createdAt: 1, updatedAt: 1,
+                    
+                    // Add the 'annotatedImageUrl' field from the first detection result
+                    annotatedImageUrl: { $ifNull: [{ $arrayElemAt: ['$detectionData.annotatedImageUrl', 0] }, null] },
+                    
+                    // Add the 'detections' array from the first detection result
+                    detections: { $ifNull: [{ $arrayElemAt: ['$detectionData.detections', 0] }, []] }
+                }
             },
-            issues: issuesToSave,
+            
+            // 4. Sort the results
+            { $sort: { createdAt: -1 } },
+        ]);
+        
+        res.json(issues);
+    } catch (error) {
+        console.error("Error fetching issues:", error);
+        res.status(500).json({ error: "Server error fetching issues." });
+    }
+});
+
+
+app.post('/api/issues', authMiddleware, upload.single('issueImage'), async (req, res) => {
+    const { title, description, location, submittedBy, latitude, longitude } = req.body;
+    let imageUrl = "";
+    
+    if (req.file) {
+        try {
+            const result = await new Promise((resolve, reject) => {
+                const uploadStream = cloudinary.uploader.upload_stream({ 
+                    folder: "janvaani_issues",
+                    transformation: [
+                        { width: 800, height: 600, crop: "fill", quality: "auto" }
+                    ]
+                }, (error, result) => {
+                    if (error) reject(error); else resolve(result);
+                });
+                uploadStream.end(req.file.buffer);
+            });
+            imageUrl = result.secure_url;
+        } catch (uploadError) {
+             console.error("Cloudinary upload error:", uploadError);
+             return res.status(500).json({ error: "Image upload failed to Cloudinary." });
+        }
+    }
+    
+    const issueData = { 
+        userId: req.userId, 
+        title, 
+        description, 
+        location, 
+        submittedBy, 
+        imageUrl: imageUrl || PLACEHOLDER_ISSUE_IMAGE // Use placeholder if no file uploaded
+    };
+    
+    if (latitude && longitude) {
+        issueData.coordinates = {
+            latitude: parseFloat(latitude),
+            longitude: parseFloat(longitude)
         };
+    }
+    
+    try {
+        const issue = new Issue(issueData);
+        await issue.save();
+        res.status(201).json(issue);
+    } catch (dbError) {
+        console.error("Database save error:", dbError);
+        res.status(500).json({ error: "Failed to save issue to database." });
+    }
+});
 
+app.post('/api/issues/:issueId/flag', authMiddleware, async (req, res) => {
+    const { issueId } = req.params;
+    const { flagType, reason } = req.body;
+    const userId = req.userId;
 
-        // 3. Save the aggregated data to the new collection ('agrigate')
-        
-        // Clear the existing data
-        await AggregatedIssue.deleteMany({});
-        
-        // Insert the new aggregated documents
-        if (issuesToSave.length > 0) {
-            await AggregatedIssue.insertMany(issuesToSave);
+    try {
+        const issue = await Issue.findById(issueId);
+        if (!issue) {
+            return res.status(404).json({ message: 'Issue not found' });
         }
 
-        console.log(`--- SAVE COMPLETE --- Inserted ${issuesToSave.length} documents into DB: ${TARGET_DB_NAME}, Collection: agrigate`);
+        if (issue.userId.toString() === userId) {
+            return res.status(400).json({ message: 'You cannot flag your own issue' });
+        }
+
+        const existingFlag = await Flag.findOne({ issueId, userId });
+        if (existingFlag) {
+            return res.status(400).json({ message: 'You have already flagged this issue' });
+        }
         
-        return aggregatedData;
-        
+        const user = await User.findById(userId).select('name email');
+        if (!user) {
+            return res.status(404).json({ message: 'Flagging user not found' });
+        }
+
+        if (flagType === 'red') {
+            issue.redFlags++;
+        } else if (flagType === 'green') {
+            issue.greenFlags++;
+        } else {
+            return res.status(400).json({ message: 'Invalid flag type' });
+        }
+
+        const flag = new Flag({
+            issueId,
+            userId,
+            userName: user.name, 
+            userEmail: user.email, 
+            type: flagType,
+            reason: flagType === 'red' ? reason : null,
+        });
+
+        await flag.save();
+        await issue.save();
+
+        res.status(200).json({ message: 'Issue flagged successfully', issue });
     } catch (error) {
-        console.error("Error during aggregation process:", error);
-        throw new Error("Failed to fetch, aggregate, or save data to the target DB.");
+        console.error("Flagging error:", error);
+        res.status(500).json({ message: 'Server error', error: error.message });
     }
-}
+});
 
 
-// --- MIDDLEWARE & ROUTES (Standard Express setup) ---
+// === MOCK ROUTES FOR TESTING IMAGE/DETECTION ===
 
-app.use(cors());
-app.use(express.json());
+app.post('/api/mock/detection', authMiddleware, async (req, res) => {
+    const { issueId } = req.body;
 
+    if (!issueId || !mongoose.Types.ObjectId.isValid(issueId)) {
+        return res.status(400).json({ message: 'Valid issueId is required' });
+    }
 
-// --- AGGREGATION ENDPOINT (Called by the Sync button) ---
-app.get('/api/sync', async (req, res) => {
     try {
-        const aggregatedData = await fetchAggregateAndSaveData();
+        const existingDetection = await Detection.findOne({ issueId });
+        if (existingDetection) {
+            return res.status(400).json({ message: 'Detection already exists for this issue' });
+        }
         
-        console.log("First saved document (partial view):", aggregatedData.issues[0]);
+        const issue = await Issue.findById(issueId);
+        if (!issue) {
+            return res.status(404).json({ message: 'Issue not found' });
+        }
 
-        res.json({ 
-            success: true, 
-            message: `Successfully saved ${aggregatedData.metadata.totalIssues} aggregated issues to DB: ${TARGET_DB_NAME}, Collection: agrigate.`,
-            metadata: aggregatedData.metadata
+        const newDetection = new Detection({
+            issueId,
+            annotatedImageUrl: PLACEHOLDER_ANNOTATED_IMAGE,
+            detections: [
+                { class: 'pothole', confidence: 0.95, box: [100, 100, 200, 200] },
+                { class: 'garbage_pile', confidence: 0.88, box: [500, 300, 700, 500] }
+            ],
+            createdAt: new Date(),
+        });
+
+        await newDetection.save();
+        res.status(201).json({ 
+            message: 'Mock Detection created successfully. Now check /api/issues.',
+            detection: newDetection
         });
 
     } catch (error) {
-        console.error("Error in /api/sync:", error);
-        res.status(500).json({ success: false, error: error.message || "Server error during data aggregation." });
+        console.error("Mock Detection Error:", error);
+        res.status(500).json({ message: 'Server error creating mock detection', error: error.message });
     }
-});
+}); // <--- FIX 1: Missing closing brace and parenthesis here
 
-
-// --- ROOT ROUTE (Serves the HTML Page) ---
+// --- ROOT ROUTE ---
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
         <html lang="en">
         <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Data Aggregator Sync Panel</title>
-            <style>
-                body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f4f4f9; }
-                .container { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); text-align: center; }
-                h1 { color: #333; }
-                #syncButton { 
-                    padding: 10px 20px; 
-                    font-size: 16px; 
-                    background-color: #007bff; 
-                    color: white; 
-                    border: none; 
-                    border-radius: 5px; 
-                    cursor: pointer; 
-                    transition: background-color 0.3s; 
-                }
-                #syncButton:hover:not(:disabled) { background-color: #0056b3; }
-                #syncButton:disabled { background-color: #a0c3ff; cursor: not-allowed; }
-                #statusMessage { margin-top: 20px; font-size: 1.1em; }
-                .success { color: #28a745; }
-                .error { color: #dc3545; }
-            </style>
+            <title>Janvaani Backend API</title>
+            <style>body { font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f4f4f9; } h1 { color: #333; } p { color: #666; }</style>
         </head>
         <body>
-            <div class="container">
-                <h1>Janvaani Data Aggregator</h1>
-                <p>Click the button to fetch, combine, and save all data into the new **agrigate** collection.</p>
-                <button id="syncButton">Sync & Save All Data</button>
-                <div id="statusMessage"></div>
-            </div>
-
-            <script>
-                document.getElementById('syncButton').addEventListener('click', async () => {
-                    const button = document.getElementById('syncButton');
-                    const status = document.getElementById('statusMessage');
-
-                    button.disabled = true;
-                    status.innerHTML = 'Syncing... Please check the server console for progress.';
-                    status.className = '';
-
-                    try {
-                        const response = await fetch('/api/sync');
-                        const data = await response.json();
-
-                        if (data.success) {
-                            status.innerHTML = `\${data.message}<br>Total Issues: \${data.metadata.totalIssues} saved.`;
-                            status.className = 'success';
-                        } else {
-                            status.innerHTML = data.error || 'Sync failed due to an unknown error.';
-                            status.className = 'error';
-                        }
-                    } catch (error) {
-                        status.innerHTML = 'Network error: Could not connect to the aggregation server.';
-                        status.className = 'error';
-                        console.error('Frontend sync error:', error);
-                    } finally {
-                        button.disabled = false;
-                    }
-                });
-            </script>
+            <h1>Janvaani Backend API</h1>
+            <p>Server is running successfully!</p>
+            <p>API is available on port ${PORT}</p>
         </body>
         </html>
     `);
@@ -336,4 +402,4 @@ app.get('/', (req, res) => {
 
 
 // --- START SERVER ---
-app.listen(PORT, () => console.log(`🚀 Data Aggregator running at http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running at http://localhost:${PORT}`));
