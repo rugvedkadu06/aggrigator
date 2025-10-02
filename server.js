@@ -10,26 +10,31 @@ config(); // Load environment variables from .env
 const app = express();
 const PORT = process.env.PORT || 5002;
 
-// --- MIDDLEWARE ---
-app.use(cors());
-app.use(express.json());
+// --- DATABASE CONNECTION CONFIGURATION ---
 
-// --- DATABASE (MONGODB) ---
-// Connecting to the 'test' database based on your last provided code snippet
-mongoose.connect(process.env.MONGO_URI, { dbName: 'test' }) 
-  .then(() => console.log("✅ MongoDB Aggregator Connected (DB: test)"))
-  .catch((err) => console.error("MongoDB Connection Error:", err));
+// 1. Connection for READING (Source DB: 'test')
+const sourceDB = mongoose.createConnection(process.env.MONGO_URI, { dbName: 'test' });
+sourceDB.on('error', (err) => console.error("Source DB Connection Error:", err));
+sourceDB.once('open', () => console.log("✅ Source MongoDB Connected (DB: test)"));
 
-// --- SCHEMAS ---
+// 2. Connection for WRITING (Target DB: 'aggregated_db' or change to 'test' if preferred)
+// Using a separate connection allows saving to a different DB, or you can point it to 'test'.
+const TARGET_DB_NAME = 'janvaani_aggregated_data'; // Name of the new database
+const targetDB = mongoose.createConnection(process.env.MONGO_URI, { dbName: TARGET_DB_NAME });
+targetDB.on('error', (err) => console.error("Target DB Connection Error:", err));
+targetDB.once('open', () => console.log(`✅ Target MongoDB Connected (DB: ${TARGET_DB_NAME})`));
 
-// 1. Detection Sub-Schema (Embedded in Issue)
+
+// --- SCHEMAS & MODELS (Bound to Source DB) ---
+
+// Schemas are defined normally, but models are created using the source connection.
+
 const DetectionSubSchema = new mongoose.Schema({
     annotatedImageUrl: String,
     detections: Array,
     detectedAt: Date,
 }, { _id: false });
 
-// 2. Issue Schema
 const IssueSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     title: String,
@@ -41,12 +46,10 @@ const IssueSchema = new mongoose.Schema({
     greenFlags: Number,
     status: String,
     detection: DetectionSubSchema,
-    // If 'priority' and 'assignedTo' are used, they should be included here too, based on image_388447.png
     priority: String, 
     assignedTo: String,
 }, { timestamps: true });
 
-// 3. Flag Schema
 const FlagSchema = new mongoose.Schema({
     issueId: { type: mongoose.Schema.Types.ObjectId, ref: 'Issue' },
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -55,7 +58,6 @@ const FlagSchema = new mongoose.Schema({
     reason: String,
 }, { timestamps: true });
 
-// 4. User Schema (Only fetching a subset of fields)
 const UserSchema = new mongoose.Schema({
     name: String,
     email: String,
@@ -64,96 +66,117 @@ const UserSchema = new mongoose.Schema({
     faceImageUrl: String,
 });
 
-// --- MODELS ---
-const User = mongoose.model("User", UserSchema);
-const Issue = mongoose.model("Issue", IssueSchema);
-const Flag = mongoose.model("Flag", FlagSchema);
+// Models bound to the sourceDB connection
+const User = sourceDB.model("User", UserSchema);
+const Issue = sourceDB.model("Issue", IssueSchema);
+const Flag = sourceDB.model("Flag", FlagSchema); // Used for fetching all flags (Step 2)
 
 
-// --- REUSABLE AGGREGATION FUNCTION ---
-async function fetchAndAggregateData() {
-    console.log(`\n--- STARTING DATA AGGREGATION at ${new Date().toLocaleTimeString()} ---`);
+// --- NEW MODEL FOR SAVING AGGREGATED DATA ---
+
+// This schema defines the structure of the final denormalized object.
+const AggregatedIssueSchema = new mongoose.Schema({
+    _id: mongoose.Schema.Types.ObjectId, // Keep the original Issue _id
+    title: String,
+    description: String,
+    status: String,
+    imageUrl: String,
+    submittedBy: String,
+    
+    // Embedded User Details
+    submittedByEmail: String,
+    
+    // Embedded Detection Data
+    annotatedImageUrl: String,
+    detections: Array,
+    detectedAt: Date,
+
+    // Embedded Flag Data
+    flags: Array,
+    
+    // Metadata
+    createdAt: Date,
+    updatedAt: Date,
+}, { collection: 'agrigate' }); // Use the requested collection name: 'agrigate'
+
+// Model bound to the targetDB connection
+const AggregatedIssue = targetDB.model("AggregatedIssue", AggregatedIssueSchema);
+
+
+// --- REUSABLE AGGREGATION AND SAVE FUNCTION ---
+async function fetchAggregateAndSaveData() {
+    console.log(`\n--- STARTING AGGREGATION AND SAVE at ${new Date().toLocaleTimeString()} ---`);
     
     try {
-        // 1. Fetch all Users
-        // NOTE: The 'users' collection used here might be in the 'test' database or the default database.
-        const users = await User.find({}).select('-otp -otpExpiry -verified -__v').lean();
-
-        // 2. Fetch all Flags
-        const flags = await Flag.find({}).select('-__v').lean();
-
-        // 3. Fetch all Issues and embed related data (Flags and User Info)
-        const issuesWithDetails = await Issue.aggregate([
-            // Stage 1: Lookup the submitting User details (from the 'users' collection)
+        // 1. Run the aggregation pipeline on the Issue model (sourceDB)
+        const issuesToAggregate = await Issue.aggregate([
             {
-                $lookup: {
-                    from: 'users', // Target collection name
-                    localField: 'userId',
-                    foreignField: '_id',
-                    as: 'submittedByUser'
-                }
+                $lookup: { from: 'users', localField: 'userId', foreignField: '_id', as: 'submittedByUser' }
             },
-            // Stage 2: De-array the submittedByUser
             { $unwind: { path: '$submittedByUser', preserveNullAndEmptyArrays: true } },
-            
-            // Stage 3: Lookup all Flags for this Issue (from the 'flags' collection)
             {
-                $lookup: {
-                    from: 'flogs', // NOTE: Using 'flogs' if that is the actual collection name for Flags, otherwise use 'flags'
-                    localField: '_id',
-                    foreignField: 'issueId',
-                    as: 'issueFlags'
-                }
+                // IMPORTANT: Using 'flogs' based on your DB screenshots.
+                $lookup: { from: 'flogs', localField: '_id', foreignField: 'issueId', as: 'issueFlags' }
             },
-            
-            // Stage 4: Project the final, cleaned data structure
             {
                 $project: {
-                    // Issue Fields
-                    _id: 1, title: 1, description: 1, location: 1,
-                    status: 1, redFlags: 1, greenFlags: 1, createdAt: 1,
-                    priority: 1, assignedTo: 1,
-                    
-                    // Image/Detection Swap Logic in Aggregation
-                    originalImageUrl: '$imageUrl',
+                    // Select and flatten all necessary fields for the new collection
+                    _id: 1, title: 1, description: 1, location: 1, status: 1, 
+                    redFlags: 1, greenFlags: 1, createdAt: 1, updatedAt: 1,
+                    priority: 1, assignedTo: 1,
+                    
+                    // Image Logic
                     imageUrl: { $ifNull: ['$detection.annotatedImageUrl', '$imageUrl'] },
-                    
-                    // Embedded Detection Data
+                    
+                    // Embedded Detection Data
                     annotatedImageUrl: '$detection.annotatedImageUrl',
                     detections: '$detection.detections',
                     detectedAt: '$detection.detectedAt',
 
-                    // Submitting User Details
+                    // Embedded User Details
                     submittedBy: '$submittedByUser.name',
                     submittedByEmail: '$submittedByUser.email',
                     
-                    // Attached Flags
+                    // Embedded Flags
                     flags: '$issueFlags',
                 }
             },
             { $sort: { createdAt: -1 } }
         ]);
 
-        // 4. Combine all results into a single object
+        // 2. Prepare the full aggregated response data (optional, for logging/metadata)
+        const users = await User.find({}).lean();
+        const flags = await Flag.find({}).lean();
+
         const aggregatedData = {
             metadata: {
                 timestamp: new Date().toISOString(),
+                totalIssues: issuesToAggregate.length,
                 totalUsers: users.length,
-                totalIssues: issuesWithDetails.length,
                 totalFlags: flags.length,
             },
-            users: users,
-            issues: issuesWithDetails,
-            flags: flags,
+            // Keeping the main result array separate for saving
+            issues: issuesToAggregate,
         };
-        
-        console.log(`--- AGGREGATION COMPLETE --- Total Issues: ${aggregatedData.metadata.totalIssues}`);
-        
+
+
+        // 3. Save the aggregated data to the new collection ('agrigate')
+        
+        // Clear the existing data in the target collection first
+        await AggregatedIssue.deleteMany({});
+        
+        // Insert the new aggregated documents
+        if (issuesToAggregate.length > 0) {
+            await AggregatedIssue.insertMany(issuesToAggregate);
+        }
+
+        console.log(`--- SAVE COMPLETE --- Inserted ${issuesToAggregate.length} documents into '${TARGET_DB_NAME}.agrigate'`);
+        
         return aggregatedData;
         
     } catch (error) {
         console.error("Error during aggregation process:", error);
-        throw new Error("Failed to fetch and aggregate data from MongoDB.");
+        throw new Error("Failed to fetch, aggregate, or save data to the target DB.");
     }
 }
 
@@ -161,14 +184,15 @@ async function fetchAndAggregateData() {
 // --- AGGREGATION ENDPOINT (Called by the Sync button) ---
 app.get('/api/sync', async (req, res) => {
     try {
-        const aggregatedData = await fetchAndAggregateData();
-        // Log the complete aggregated data to the backend console
-        console.log("Full Aggregated Data (partial view):", aggregatedData.issues.slice(0, 2));
+        const aggregatedData = await fetchAggregateAndSaveData();
+        
+        // Log the saved data result to the backend console
+        console.log("First 2 saved documents (partial view):", aggregatedData.issues.slice(0, 2));
 
         // Return a summary to the client
         res.json({ 
             success: true, 
-            message: 'Data sync complete. Results logged to server console.',
+            message: `Successfully saved ${aggregatedData.metadata.totalIssues} aggregated issues to DB: ${TARGET_DB_NAME}, Collection: agrigate.`,
             metadata: aggregatedData.metadata
         });
 
@@ -180,8 +204,9 @@ app.get('/api/sync', async (req, res) => {
 
 
 // --- ROOT ROUTE (Serves the HTML Page) ---
+// (HTML code remains the same as before)
 app.get('/', (req, res) => {
-    res.send(`
+    res.send(`
         <!DOCTYPE html>
         <html lang="en">
         <head>
